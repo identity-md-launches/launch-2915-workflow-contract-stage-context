@@ -6,6 +6,7 @@ import {BaseTest} from "./Base.t.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {SwapParams} from "v4-core/types/PoolOperation.sol";
+import {Pool} from "v4-core/libraries/Pool.sol";
 import {UnlockV2Token} from "../src/UnlockV2Token.sol";
 import {UnlockV2Hook} from "../src/UnlockV2Hook.sol";
 import {MigrationVault} from "../src/MigrationVault.sol";
@@ -36,7 +37,10 @@ contract LaunchHandler is Test {
     uint256 public ghostMaxVolume;
     bool public ghostRegression;
     bool public ghostUnexpectedRevert;
+    bool public ghostSpikeOpenedGate;
+    bool public ghostGatePriceAboveSpot;
     uint256 public calls;
+    bytes4 internal lastSwapError;
 
     constructor(
         UnlockV2Token token_,
@@ -75,10 +79,14 @@ contract LaunchHandler is Test {
         if (hook.cumulativeVolumeUsd() < ghostMaxVolume) ghostRegression = true;
         ghostMaxGates = hook.gatesOpen();
         ghostMaxVolume = hook.cumulativeVolumeUsd();
+        (uint256 spot, bool sv) = hook.imdUsdPrice();
+        (uint256 gp, bool gv) = hook.gateImdUsdPrice();
+        if (sv && gv && gp > spot) ghostGatePriceAboveSpot = true;
     }
 
     function _swap(address who, bool isBuy, int256 amountSpecified) internal returns (bool ok) {
         bool zeroForOne = isBuy ? !tokenIs0 : tokenIs0;
+        lastSwapError = bytes4(0);
         vm.prank(who);
         try router.swap(
             key,
@@ -89,14 +97,42 @@ contract LaunchHandler is Test {
             })
         ) {
             ok = true;
-        } catch {
+        } catch (bytes memory err) {
             ok = false;
+            if (err.length >= 4) lastSwapError = bytes4(err);
         }
     }
 
     function buy(uint256 who, uint256 imdIn) external {
         imdIn = bound(imdIn, 1e15, 300e18);
         _swap(_actor(who), true, -int256(imdIn));
+        _track();
+    }
+
+    /// @dev Same-block price spike and sell-back attempt: whatever the spike does to the spot FDV, it must
+    ///      not open an FDV gate within its own block (only volume or burns may).
+    function spikeAndSellBack(uint256 who, uint256 imdIn) external {
+        // a spike left in place opens gates at the next block (disclosed); keep it rare so the
+        // pre-gate-10 properties still get coverage
+        if (hook.gatesOpen() >= 10 || imdIn % 4 != 0) return;
+        address a = _actor(who);
+        _swap(a, true, -1e15); // this block's settled FDV reading happens here (or already happened)
+        uint8 g = hook.gatesOpen();
+        if (g >= 10) {
+            _track();
+            return;
+        }
+        uint256 bal = token.balanceOf(a);
+        _swap(a, true, -int256(bound(imdIn, 1000e18, 6000e18)));
+        uint256 got = token.balanceOf(a) - bal;
+        // matured credit may cover part of a sell-back: keep the sold-before-gate-10 ghost exact
+        if (got > 0 && got <= hook.sellAllowance(a) && _swap(a, false, -int256(got))) {
+            if (hook.gatesOpen() < 10) ghostSoldBeforeGolden[a] += got;
+        } else if (got > 0 && _swap(a, false, -int256(got))) {
+            ghostRegression = true; // sold more than the allowance in the spike's own block
+        }
+        (,, uint256 volT,) = hook.gate(g + 1);
+        if (hook.cumulativeVolumeUsd() < volT && hook.gatesOpen() != g) ghostSpikeOpenedGate = true;
         _track();
     }
 
@@ -109,10 +145,17 @@ contract LaunchHandler is Test {
         if (cap < 1e12) return;
         uint256 amount = bound(frac, 1e12, cap);
         UnlockV2Hook.Rights memory before = hook.rightsOf(a);
+        // the block's first official swap reads the settled FDV in beforeSwap and may open gates
+        // (up to the final bypass) before its own quota check
+        bool readingPending = hook.lastFdvBlock() != block.number;
         if (!_swap(a, false, -int256(amount))) {
-            ghostUnexpectedRevert = true;
+            // an earlier sell can drain the mock position and park the price at the swap limit; the
+            // pool manager then rejects any further sell before the hook runs. That is pool liquidity,
+            // not a quota decision, so only other reverts count as unexpected.
+            if (lastSwapError != Pool.PriceLimitAlreadyExceeded.selector) ghostUnexpectedRevert = true;
             return;
         }
+        if (readingPending && hook.gatesOpen() >= 10) golden = true;
         if (!golden) {
             ghostSoldBeforeGolden[a] += amount;
             UnlockV2Hook.Rights memory r = hook.rightsOf(a);
@@ -125,7 +168,9 @@ contract LaunchHandler is Test {
 
     function sellTooMuch(uint256 who) external {
         address a = _actor(who);
-        if (hook.gatesOpen() >= 10) return;
+        // let this block's settled FDV reading happen first: sellAllowance() does not preview it
+        if (hook.lastFdvBlock() != block.number) _swap(a, true, -1e15);
+        if (hook.lastFdvBlock() != block.number || hook.gatesOpen() >= 10) return;
         uint256 allowance = hook.sellAllowance(a);
         if (token.balanceOf(a) <= allowance + 1e12) return;
         // selling more than the allowance must always fail
@@ -279,6 +324,10 @@ contract InvariantsTest is BaseTest {
         assertFalse(handler.ghostRegression(), "gate/volume regressed, burn/transfer created rights, or oversell");
         assertFalse(handler.ghostUnexpectedRevert(), "sell within allowance reverted");
         assertLe(hook.gatesOpen(), 10);
+        assertFalse(handler.ghostSpikeOpenedGate(), "a same-block spike opened an FDV gate");
+        assertFalse(handler.ghostGatePriceAboveSpot(), "gate IMD price above spot");
+        assertGt(hook.trackedImdPerEth(), 0, "reference tracker lost its seed");
+        assertLe(hook.trackedAt(), block.timestamp);
         for (uint256 i; i < 3; i++) {
             address a = handler.actorAt(i);
             UnlockV2Hook.Rights memory r = hook.rightsOf(a);

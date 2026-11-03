@@ -294,6 +294,49 @@ contract ForkRehearsalTest is Test {
         assertEq(token.balanceOf(bob), 1000e18);
     }
 
+    /// Re-check of finding 3284f846 on live state: a spike bought through the live Universal Router is
+    /// not read inside its own block and cannot be sold back there; the tracker is seeded from the live
+    /// reference pool and the gate price never exceeds spot.
+    function test_fork_spikeThroughLiveRouterOpensNothingInItsBlock() public {
+        if (!_fork()) return;
+        _activate();
+        (uint256 spotRef,) = hook.imdUsdPrice();
+        (uint256 gateRef, bool gv) = hook.gateImdUsdPrice();
+        assertTrue(gv);
+        assertEq(gateRef, spotRef, "tracker seeded at the live reference spot");
+        assertGt(hook.trackedImdPerEth(), 0);
+        assertEq(hook.trackedAt(), block.timestamp);
+
+        deal(IMD, alice, 100_000e18);
+        _approveViaPermit2(alice, IMD);
+        _approveViaPermit2(alice, address(token));
+        _urSwap(alice, true, true, 1e18, 0); // the block's settled reading
+        assertEq(hook.lastFdvBlock(), block.number);
+        uint256 settled = hook.lastFdvUsd();
+        _urSwap(alice, true, true, 20_000e18, 0);
+        (uint256 spotFdv, bool ok) = hook.fdvUsd();
+        assertTrue(ok);
+        assertGt(spotFdv, settled * 10, "the buy moved the spot FDV a lot");
+        assertEq(hook.lastFdvUsd(), settled, "no re-read inside the block");
+        assertEq(hook.gatesOpen(), 0, "spike opened a gate in its own block");
+        uint256 bal = token.balanceOf(alice);
+        vm.expectRevert();
+        _urSwap(alice, false, true, uint128(bal), 0);
+        assertEq(token.balanceOf(alice), bal);
+
+        // held across a block boundary, the next block's first swap reads it (disclosed behaviour)
+        vm.roll(block.number + 1);
+        vm.warp(block.timestamp + 12);
+        // the spike ran the test position to its price limit, so the next swap is a small sell
+        // of matured buy credit
+        _urSwap(alice, false, true, 1e18, 0);
+        assertEq(hook.lastFdvBlock(), block.number);
+        assertGt(hook.gatesOpen() == 10 ? spotFdv : hook.lastFdvUsd(), settled);
+        (, uint256 fdvT1,,) = hook.gate(1);
+        if (hook.lastFdvUsd() >= fdvT1) assertGt(hook.gatesOpen(), 0);
+        else assertEq(hook.gatesOpen(), 0);
+    }
+
     // ------------------------------------------------------------------ live V1 migration
 
     function test_fork_migrationWithLiveV1() public {

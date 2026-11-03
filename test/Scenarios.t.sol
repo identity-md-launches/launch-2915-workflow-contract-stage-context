@@ -249,13 +249,37 @@ contract ScenariosTest is BaseTest {
         assertEq(hook.burnProgress(), 0);
     }
 
-    function test_gatesNeverRelockWhenPriceFalls() public {
-        // one buy that exhausts the mock pool's in-range liquidity spikes the spot FDV past every gate
+    /// Re-check of finding 3284f846 (spot FDV + gate-10 bypass in one transaction): after the fix the
+    /// spike opens nothing inside its own block and the buyer cannot sell it back there.
+    function test_inBlockSpikeOpensNothingAndCannotBeSoldBack() public {
+        uint256 imdBefore = imd.balanceOf(carol);
         buy(carol, -5000e18);
+        (uint256 spotFdv,) = hook.fdvUsd();
+        (, uint256 fdvT10,,) = hook.gate(10);
+        assertGe(spotFdv, fdvT10, "spot FDV is past gate 10");
+        assertEq(hook.gatesOpen(), 0, "spike read in its own block");
+        assertEq(hook.sellAllowance(OWNER), 0);
+        uint256 bal = token.balanceOf(carol);
+        vm.expectRevert();
+        sell(carol, -int256(bal));
+        // the block's one reading was taken before the spike; nothing in this block re-reads it
+        assertEq(hook.lastFdvBlock(), vm.getBlockNumber());
+        assertEq(hook.gatesOpen(), 0);
+        assertEq(token.balanceOf(carol), bal);
+        assertLt(imd.balanceOf(carol), imdBefore, "the spike's IMD stays at risk");
+    }
+
+    function test_gatesNeverRelockWhenPriceFalls() public {
+        // one buy that exhausts the mock pool's in-range liquidity spikes the spot FDV past every gate;
+        // it is read at the next block's first swap (price held across one block boundary, disclosed)
+        buy(carol, -5000e18);
+        assertEq(hook.gatesOpen(), 0);
+        vm.roll(vm.getBlockNumber() + 1);
+        // carol's sell is the next block's first swap: the settled reading opens every gate first
+        sell(carol, -int256(token.balanceOf(carol) / 2));
         assertEq(hook.gatesOpen(), 10);
         // price and ETH/USD then collapse: gates stay open forever
         feed.set(1e8, vm.getBlockTimestamp());
-        sell(carol, -int256(token.balanceOf(carol) / 2));
         vm.roll(vm.getBlockNumber() + 1);
         sell(carol, -int256(token.balanceOf(carol)));
         (uint256 fdv,) = hook.fdvUsd();
