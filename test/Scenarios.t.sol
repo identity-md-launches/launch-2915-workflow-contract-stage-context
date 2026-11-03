@@ -289,6 +289,67 @@ contract ScenariosTest is BaseTest {
         assertEq(hook.sellAllowance(alice), type(uint256).max);
     }
 
+    /// Re-check of finding e4f2d829 (views did not preview the block's pending FDV reading), fixed by
+    /// pendingGatesOpen(): the original reproduction — a spike held over a block boundary, then a sell
+    /// above the stored allowance as the next block's first swap.
+    function test_pendingGatesOpen_previewsHeldSpikeBeforeFirstSwap() public {
+        buy(carol, -5000e18);
+        // same block: the reading already happened, the preview does not re-read the spiked price
+        assertEq(hook.lastFdvBlock(), vm.getBlockNumber());
+        assertEq(hook.pendingGatesOpen(), 0, "no second reading inside the spike's block");
+
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.gatesOpen(), 0, "stored state");
+        uint256 bal = token.balanceOf(carol);
+        assertLt(hook.sellAllowance(carol), bal, "stored allowance: 20% of the matured buy before gate 1");
+        (uint8 quoted,) = hook.contributionQuote();
+        assertEq(quoted, 1, "stored quote");
+        assertEq(hook.pendingGatesOpen(), 10, "preview: the reading opens every gate");
+
+        // the sell beyond the stored allowance is judged under the previewed gates
+        sell(carol, -int256(bal));
+        assertEq(token.balanceOf(carol), 0);
+        assertEq(hook.gatesOpen(), 10);
+        assertEq(hook.pendingGatesOpen(), 10);
+
+        // a contribution quoted from the stored state is rejected once the reading has opened gate 10
+        vm.prank(OWNER);
+        vm.expectRevert(UnlockV2Hook.GoldenVaultOpen.selector);
+        token.contribute(quoted, 1e18);
+    }
+
+    function test_pendingGatesOpen_staleFeedPreviewsNothing() public {
+        // ETH/USD jumps 10x (settled FDV ~ 1m USD: gates 1-3) but the update is a day old: invalid reading
+        _warp(t0 + 1 days);
+        feed.set(30_000e8, t0);
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.pendingGatesOpen(), 0, "invalid reading previews nothing");
+        buy(alice, -1e15);
+        assertEq(hook.gatesOpen(), 0, "and opens nothing");
+        // same price, fresh: the next block's reading opens what it supports, as previewed
+        feed.set(30_000e8, vm.getBlockTimestamp());
+        assertEq(hook.pendingGatesOpen(), 0, "already read in this block");
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.pendingGatesOpen(), 3);
+        buy(alice, -1e15);
+        assertEq(hook.gatesOpen(), 3);
+    }
+
+    /// The preview over a gate that had burn progress: the progress belongs to the gate collecting burns
+    /// and must not be counted again toward the gates an FDV reading opens after it (_advanceGates
+    /// restarts it at zero). Kept below the smallest burn target (2m), where the preview is exact; the
+    /// case above it is a reported finding (.imd-findings.json), not asserted here.
+    function test_pendingGatesOpen_withSmallBurnProgressMatchesReading() public {
+        vm.prank(OWNER);
+        token.contribute(1, 1_000_000e18);
+        feed.set(9_000e8, vm.getBlockTimestamp()); // settled FDV ~ 300k: gate 1 only
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.pendingGatesOpen(), 1);
+        buy(alice, -1e15);
+        assertEq(hook.gatesOpen(), 1);
+        assertEq(hook.burnProgress(), 0, "gate 2 starts its burn count from zero");
+    }
+
     // ------------------------------------------------------------------ stale feeds / idle
 
     function test_staleFeedVariants_noVolumeButTradesAndContributionsWork() public {

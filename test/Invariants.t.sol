@@ -39,6 +39,9 @@ contract LaunchHandler is Test {
     bool public ghostUnexpectedRevert;
     bool public ghostSpikeOpenedGate;
     bool public ghostGatePriceAboveSpot;
+    /// @dev pendingGatesOpen() disagreed with the gates the block's first swap actually opened by FDV.
+    bool public ghostPreviewMismatch;
+    uint256 public previewChecks;
     uint256 public calls;
     bytes4 internal lastSwapError;
 
@@ -87,6 +90,12 @@ contract LaunchHandler is Test {
     function _swap(address who, bool isBuy, int256 amountSpecified) internal returns (bool ok) {
         bool zeroForOne = isBuy ? !tokenIs0 : tokenIs0;
         lastSwapError = bytes4(0);
+        // the block's first official swap takes the settled FDV reading; pendingGatesOpen() must preview it
+        bool readingPending = hook.lastFdvBlock() != block.number;
+        uint8 preview = hook.pendingGatesOpen();
+        // the preview keeps the current burn progress for every later gate instead of restarting it at
+        // zero (reported in .imd-findings.json); below the smallest burn target that cannot matter
+        bool progressBelowEveryTarget = hook.burnProgress() < 2_000_000e18;
         vm.prank(who);
         try router.swap(
             key,
@@ -97,9 +106,23 @@ contract LaunchHandler is Test {
             })
         ) {
             ok = true;
+            if (readingPending && progressBelowEveryTarget) _checkPreview(preview);
         } catch (bytes memory err) {
             ok = false;
             if (err.length >= 4) lastSwapError = bytes4(err);
+        }
+    }
+
+    /// @dev After the block's first swap: the reading opened exactly `preview` gates; any beyond it were
+    ///      opened by the swap's own volume (afterSwap), which needs the volume threshold of gate preview+1.
+    function _checkPreview(uint8 preview) internal {
+        previewChecks++;
+        uint8 g = hook.gatesOpen();
+        if (g < preview) {
+            ghostPreviewMismatch = true;
+        } else if (g > preview) {
+            (,, uint256 volT,) = hook.gate(preview + 1);
+            if (hook.cumulativeVolumeUsd() < volT) ghostPreviewMismatch = true;
         }
     }
 
@@ -326,6 +349,7 @@ contract InvariantsTest is BaseTest {
         assertLe(hook.gatesOpen(), 10);
         assertFalse(handler.ghostSpikeOpenedGate(), "a same-block spike opened an FDV gate");
         assertFalse(handler.ghostGatePriceAboveSpot(), "gate IMD price above spot");
+        assertFalse(handler.ghostPreviewMismatch(), "pendingGatesOpen() did not preview the block's reading");
         assertGt(hook.trackedImdPerEth(), 0, "reference tracker lost its seed");
         assertLe(hook.trackedAt(), block.timestamp);
         for (uint256 i; i < 3; i++) {
