@@ -29,9 +29,11 @@ contract LaunchTest is BaseTest {
         assertEq(uint160(address(hook)) & Hooks.ALL_HOOK_MASK, hook.requiredAddressFlags());
         Hooks.Permissions memory p = hook.getHookPermissions();
         assertTrue(
-            p.beforeInitialize && p.beforeSwap && p.afterSwap && p.beforeSwapReturnDelta && p.afterSwapReturnDelta
+            p.beforeInitialize && p.beforeAddLiquidity && p.beforeSwap && p.afterSwap && p.beforeSwapReturnDelta
+                && p.afterSwapReturnDelta
         );
-        assertFalse(p.beforeRemoveLiquidity || p.afterRemoveLiquidity || p.beforeAddLiquidity);
+        assertFalse(p.beforeRemoveLiquidity || p.afterRemoveLiquidity || p.afterAddLiquidity);
+        assertEq(hook.requiredAddressFlags(), 0x28CC);
     }
 
     function test_factoryInitializesIntendedPoolOnce() public {

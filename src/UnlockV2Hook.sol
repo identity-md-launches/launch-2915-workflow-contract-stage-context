@@ -62,6 +62,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     uint256 public constant REFERENCE_MOVE_BPS_PER_HOUR = 500;
     /// @notice Longest gap the tracker can use up in one update, so a single reading moves it at most 20%.
     uint256 public constant REFERENCE_MAX_GAP = 4 hours;
+    /// @notice Precision of the tracker's per-update move (fractional basis points are kept).
+    uint256 public constant RATE_PRECISION = 1e18;
     uint8 public constant FEED_DECIMALS = 8;
     /// @notice Sell allowance of official-pool buys before gate 1 (percent).
     uint256 public constant PRE_GATE_BUY_PCT = 20;
@@ -128,9 +130,15 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
 
     mapping(address => Rights) internal _rights;
 
+    /// @notice UNLK2 `account` burned beyond its credits so far (uncredited balance it destroyed). A later
+    ///         swarm or founder credit is netted against it, so burning before the credit is recorded gives
+    ///         the same result as burning after it (burns never create or keep eligibility).
+    mapping(address => uint256) public uncreditedBurned;
+
     // swap context (set in beforeSwap, consumed in afterSwap, within one PoolManager lock)
     address private _ctxTrader;
     bool private _ctxIsSell;
+    uint256 private _ctxFeeSpecified;
     bool private _redeeming;
 
     // ------------------------------------------------------------------ events
@@ -147,9 +155,12 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     event FounderCredited(address indexed account, uint256 amount);
     event BurnDebited(address indexed account, uint256 amount, uint256 fromPending, uint256 fromBuy, uint256 fromOther);
     event HookFeeCollected(uint256 amount, bool isSell);
+    event PartialFillRefunded(address indexed trader, uint256 requested, uint256 executed, uint256 refund);
     event Contributed(address indexed account, uint8 indexed gate, uint256 amount, uint256 progressAfter);
     event VoluntaryBurn(address indexed account, uint256 amount);
     event FeesRedeemed(uint256 amount);
+    event SurplusClaimsAttributed(uint256 amount);
+    event CreditNetted(address indexed account, uint256 requested, uint256 netted);
     event Observation(bool valid, uint256 imdUsd, uint256 fdvUsd, uint256 volumeUsdAdded);
 
     // ------------------------------------------------------------------ errors
@@ -182,6 +193,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     error StaleGate(uint8 expected, uint8 current);
     error ExceedsGateRemaining(uint256 amount, uint256 remaining);
     error GoldenVaultOpen();
+    error HookNotBound(address boundHook);
+    error LiquidityRestricted(address sender);
 
     // ------------------------------------------------------------------ modifiers
 
@@ -256,7 +269,7 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             afterAddLiquidity: false,
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
@@ -273,8 +286,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
 
     /// @notice The address flag bits this hook must be deployed at.
     function requiredAddressFlags() external pure returns (uint160) {
-        return Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-            | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+        return Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+            | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
     }
 
     // ------------------------------------------------------------------ owner setup (before seal)
@@ -293,9 +306,12 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         emit SwarmDistributorSet(distributor);
     }
 
-    /// @notice Opens trading and seals configuration forever. Requires: official pool initialized,
-    ///         correct chain, migration vault fully funded, pricing references available.
+    /// @notice Opens trading and seals configuration forever. Requires: this hook bound to the token,
+    ///         official pool initialized, correct chain, migration vault fully funded, pricing references
+    ///         available.
     function activate() external onlyOwner notSealed {
+        address bound = token.hook();
+        if (bound != address(this)) revert HookNotBound(bound);
         if (!poolInitialized) revert PoolNotInitialized();
         if (block.chainid != expectedChainId) revert WrongChain(block.chainid);
         uint256 backing = migrationVault.remainingBacking();
@@ -313,8 +329,9 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         (trackedImdPerEth,) = _referenceSpot();
         trackedAt = block.timestamp;
         rewardPot.activate();
-        _rights[owner].otherCredited += uint128(FOUNDER_ALLOCATION);
-        emit FounderCredited(owner, FOUNDER_ALLOCATION);
+        uint256 founderCredit = _netCredit(owner, FOUNDER_ALLOCATION);
+        _rights[owner].otherCredited += uint128(founderCredit);
+        emit FounderCredited(owner, founderCredit);
         emit Activated(block.timestamp, price);
     }
 
@@ -343,12 +360,18 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         revert HookNotImplemented();
     }
 
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+    /// @notice Liquidity may be added by anyone while trading is closed (the launch's own seeding, however
+    ///         it is routed) and only by the factory afterwards: a token-only range order placed by a holder
+    ///         would otherwise convert UNLK2 to IMD inside the official pool without any sell quota.
+    ///         Removal (including the factory's zero-delta fee collection) is never intercepted.
+    function beforeAddLiquidity(address sender, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
         external
-        pure
+        view
+        onlyPoolManager
         returns (bytes4)
     {
-        revert HookNotImplemented();
+        if (activated && sender != factory) revert LiquidityRestricted(sender);
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     function afterAddLiquidity(
@@ -395,17 +418,18 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         _ctxIsSell = isSell;
         _observeSettledFdv();
 
-        // IMD is the specified currency on exact-input buys and exact-output sells: take the fee here.
+        // IMD is the specified currency on exact-input buys and exact-output sells: take the fee here, on the
+        // requested amount, as a claim. It is attributed in `afterSwap`, where a partial fill (price limit or
+        // exhausted liquidity) recomputes it on the executed leg and returns the difference to the trader.
         int128 feeSpecified = 0;
         if ((!isSell && exactInput) || (isSell && !exactInput)) {
             uint256 amount = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
             uint256 fee = hookFee(amount);
             if (fee != 0) {
                 poolManager.mint(address(this), Currency.wrap(imd).toId(), fee);
-                rewardPot.onFeeAccrued(fee);
                 feeSpecified = fee.toInt128();
-                emit HookFeeCollected(fee, isSell);
             }
+            _ctxFeeSpecified = fee;
         }
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(feeSpecified, 0), 0);
     }
@@ -417,18 +441,43 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     {
         address trader = _ctxTrader;
         bool isSell = _ctxIsSell;
+        uint256 feeSpecified = _ctxFeeSpecified;
         bool exactInput = params.amountSpecified < 0;
         delete _ctxTrader;
         delete _ctxIsSell;
+        delete _ctxFeeSpecified;
 
         int128 imdDelta = tokenIsCurrency0 ? delta.amount1() : delta.amount0();
         int128 tokenDelta = tokenIsCurrency0 ? delta.amount0() : delta.amount1();
         uint256 imdLeg = _abs(imdDelta);
         uint256 tokenLeg = _abs(tokenDelta);
 
-        // IMD is the unspecified currency on exact-input sells and exact-output buys: take the fee here.
         int128 feeUnspecified = 0;
-        if ((isSell && exactInput) || (!isSell && !exactInput)) {
+        if ((!isSell && exactInput) || (isSell && !exactInput)) {
+            // IMD was the specified currency: `beforeSwap` took the fee on the requested amount and the pool
+            // was asked for the rest (exact input: requested - fee; exact output: requested + fee). When it
+            // filled less, the fee is recomputed on the executed leg and the excess returned to the trader.
+            uint256 requested = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+            uint256 expected = exactInput ? requested - feeSpecified : requested + feeSpecified;
+            uint256 fee = feeSpecified;
+            if (imdLeg < expected) {
+                // an exact-output sell filled between the requested output and requested + fee would
+                // compute slightly more than the up-front fee: never charge more than was taken
+                fee = hookFee(imdLeg);
+                if (fee > feeSpecified) fee = feeSpecified;
+                uint256 refund = feeSpecified - fee;
+                if (refund != 0) {
+                    poolManager.burn(address(this), Currency.wrap(imd).toId(), refund);
+                    poolManager.take(Currency.wrap(imd), trader, refund);
+                    emit PartialFillRefunded(trader, requested, imdLeg, refund);
+                }
+            }
+            if (fee != 0) {
+                rewardPot.onFeeAccrued(fee);
+                emit HookFeeCollected(fee, isSell);
+            }
+        } else {
+            // IMD is the unspecified currency on exact-input sells and exact-output buys: fee on the executed leg.
             uint256 fee = hookFee(imdLeg);
             if (fee != 0) {
                 poolManager.mint(address(this), Currency.wrap(imd).toId(), fee);
@@ -501,19 +550,30 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         bytes32 leaf = keccak256(abi.encodePacked(index, account, amount));
         if (!MerkleProof.verify(proof, IMerkleDistributor(distributor).merkleRoot(), leaf)) revert InvalidProof();
         swarmIndexCredited[index] = true;
-        _rights[account].otherCredited += amount.toUint128();
-        emit SwarmClaimCredited(account, index, amount);
+        uint256 credit = _netCredit(account, amount);
+        _rights[account].otherCredited += credit.toUint128();
+        emit SwarmClaimCredited(account, index, credit);
     }
 
-    /// @notice Pending hook fees held as ERC-6909 IMD claims in the PoolManager.
+    /// @notice Pending hook fees held as ERC-6909 IMD claims in the PoolManager. Includes any IMD claims a
+    ///         third party minted or transferred to the hook; those are attributed to the pot on redemption.
     function pendingFees() public view returns (uint256) {
         return poolManager.balanceOf(address(this), Currency.wrap(imd).toId());
     }
 
     /// @notice Moves collected IMD fees from the PoolManager into the reward pot. Anyone may call.
+    /// @dev Claims above what the pot has attributed (anyone can mint or transfer ERC-6909 IMD claims to
+    ///      this address) are attributed as a reward fee first, so redemption never reverts for a surplus
+    ///      and the gift belongs to the points holders like any other fee.
     function redeemFees() external returns (uint256 amount) {
         amount = pendingFees();
         if (amount == 0) revert NothingToRedeem();
+        uint256 owed = rewardPot.totalAccrued() - rewardPot.totalRedeemed();
+        if (amount > owed) {
+            uint256 surplus = amount - owed;
+            rewardPot.onFeeAccrued(surplus);
+            emit SurplusClaimsAttributed(surplus);
+        }
         _redeeming = true;
         poolManager.unlock(abi.encode(amount));
         _redeeming = false;
@@ -581,11 +641,32 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         return gatesOpen >= GATE_COUNT;
     }
 
+    /// @notice Gates that would be open after this block's FDV reading, which the first official swap of the
+    ///         block takes before its own quota check. Equals `gatesOpen` once that reading has happened.
+    ///         `sellAllowance()` and `contributionQuote()` report the stored state; a frontend quoting a sell
+    ///         or a contribution in a block that has not traded yet should read this first.
+    function pendingGatesOpen() external view returns (uint8 open) {
+        open = gatesOpen;
+        if (lastFdvBlock == block.number || open >= GATE_COUNT) return open;
+        (uint256 imdUsd, bool v1) = gateImdUsdPrice();
+        (uint256 tokenImd, bool v2) = tokenPriceInImd();
+        if (!v1 || !v2) return open;
+        uint256 usdPerToken = FullMath.mulDiv(tokenImd, imdUsd, 1e18);
+        uint256 fdv = FullMath.mulDiv(usdPerToken, token.totalSupply(), 1e18);
+        while (open < GATE_COUNT) {
+            (, uint256 fdvT, uint256 volT, uint256 burnT) = gate(open + 1);
+            bool opens = gateBurned - burnBaseline >= burnT || fdv >= fdvT || cumulativeVolumeUsd >= volT;
+            if (!opens) break;
+            open++;
+        }
+    }
+
     /// @notice The 1% reward fee on an IMD amount, rounded down. Its base depends on the swap shape:
     ///         exact-input buy: the trader's gross IMD input; exact-output buy: the pool's IMD input
     ///         (trader pays it plus the fee); exact-input sell: the pool's IMD output (trader receives it
     ///         minus the fee); exact-output sell: the trader's requested IMD output (the pool delivers it
-    ///         plus the fee).
+    ///         plus the fee). When an exact-input buy or exact-output sell fills only partly, the base is
+    ///         the executed pool IMD leg and the rest of the up-front fee is returned to the trader.
     function hookFee(uint256 imdAmount) public pure returns (uint256) {
         return imdAmount * HOOK_FEE_BPS / BPS;
     }
@@ -738,14 +819,16 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     }
 
     /// @dev The tracker moved toward `spot`, by at most REFERENCE_MOVE_BPS_PER_HOUR of the time since its last
-    ///      update (gap capped at REFERENCE_MAX_GAP). Same timestamp: no movement.
+    ///      update (gap capped at REFERENCE_MAX_GAP). Same timestamp: no movement. The allowed move is kept
+    ///      at 1e18 precision so that a short gap (one 12-second block is 1.67 bps) is not floored to whole
+    ///      basis points: frequent updates follow the reference pool at the same rate as sparse ones.
     function _nextTracked(uint256 spot) internal view returns (uint256) {
         uint256 tracked = trackedImdPerEth;
         uint256 gap = block.timestamp - trackedAt;
         if (gap > REFERENCE_MAX_GAP) gap = REFERENCE_MAX_GAP;
-        uint256 moveBps = gap * REFERENCE_MOVE_BPS_PER_HOUR / 1 hours;
-        uint256 upper = FullMath.mulDiv(tracked, BPS + moveBps, BPS);
-        uint256 lower = FullMath.mulDiv(tracked, BPS, BPS + moveBps);
+        uint256 moveScaled = gap * REFERENCE_MOVE_BPS_PER_HOUR * RATE_PRECISION / 1 hours;
+        uint256 upper = FullMath.mulDiv(tracked, BPS * RATE_PRECISION + moveScaled, BPS * RATE_PRECISION);
+        uint256 lower = FullMath.mulDiv(tracked, BPS * RATE_PRECISION, BPS * RATE_PRECISION + moveScaled);
         if (spot > upper) return upper;
         if (spot < lower) return lower;
         return spot;
@@ -896,7 +979,21 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         r.pendingBuy -= uint128(fromPending);
         r.buyCredited -= uint128(fromBuy);
         r.otherCredited -= uint128(fromOther);
+        uint256 uncredited = amount - fromPending - fromBuy - fromOther;
+        if (uncredited != 0) uncreditedBurned[account] += uncredited;
         emit BurnDebited(account, amount, fromPending, fromBuy, fromOther);
+    }
+
+    /// @dev A swarm or founder credit for tokens the account may already have burned: the part it burned
+    ///      while uncredited is consumed instead of credited, so the call order of burn and credit does not
+    ///      matter. Migration credits are not netted (they are recorded in the same call as the tokens).
+    function _netCredit(address account, uint256 amount) internal returns (uint256 credit) {
+        uint256 burned = uncreditedBurned[account];
+        if (burned == 0) return amount;
+        uint256 netted = burned < amount ? burned : amount;
+        uncreditedBurned[account] = burned - netted;
+        emit CreditNetted(account, amount, netted);
+        return amount - netted;
     }
 
     function _abs(int128 x) internal pure returns (uint256) {

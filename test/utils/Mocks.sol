@@ -101,6 +101,32 @@ contract AuthRouter is IUnlockCallback {
     }
 }
 
+/// @notice Anyone can do this: settle IMD into the PoolManager and mint the ERC-6909 claim to another address.
+contract ClaimDonor is IUnlockCallback {
+    IPoolManager public immutable manager;
+    IERC20 public immutable imd;
+
+    constructor(IPoolManager m, IERC20 i) {
+        manager = m;
+        imd = i;
+    }
+
+    function donate(address to, uint256 amount) external {
+        manager.unlock(abi.encode(to, amount));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (address to, uint256 amount) = abi.decode(data, (address, uint256));
+        Currency c = Currency.wrap(address(imd));
+        manager.sync(c);
+        imd.transfer(address(manager), amount);
+        manager.settle();
+        manager.mint(to, c.toId(), amount);
+        return "";
+    }
+}
+
 /// @notice Exposes gate internals for unit tests of the threshold logic.
 contract HookHarness is UnlockV2Hook {
     constructor(

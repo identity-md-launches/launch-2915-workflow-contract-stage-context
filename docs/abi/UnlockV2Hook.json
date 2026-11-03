@@ -229,6 +229,19 @@
   },
   {
     "type": "function",
+    "name": "RATE_PRECISION",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "REFERENCE_FEE",
     "inputs": [],
     "outputs": [
@@ -769,7 +782,7 @@
     "name": "beforeAddLiquidity",
     "inputs": [
       {
-        "name": "",
+        "name": "sender",
         "type": "address",
         "internalType": "address"
       },
@@ -845,7 +858,7 @@
         "internalType": "bytes4"
       }
     ],
-    "stateMutability": "pure"
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -1746,6 +1759,19 @@
   },
   {
     "type": "function",
+    "name": "pendingGatesOpen",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "open",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "poolInitialized",
     "inputs": [],
     "outputs": [
@@ -2117,6 +2143,25 @@
   },
   {
     "type": "function",
+    "name": "uncreditedBurned",
+    "inputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "unlockCallback",
     "inputs": [
       {
@@ -2266,6 +2311,31 @@
   },
   {
     "type": "event",
+    "name": "CreditNetted",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "requested",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "netted",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "FeesRedeemed",
     "inputs": [
       {
@@ -2404,6 +2474,37 @@
   },
   {
     "type": "event",
+    "name": "PartialFillRefunded",
+    "inputs": [
+      {
+        "name": "trader",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "requested",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "executed",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "refund",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "PoolInitialized",
     "inputs": [
       {
@@ -2464,6 +2565,19 @@
       },
       {
         "name": "fromOther",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "SurplusClaimsAttributed",
+    "inputs": [
+      {
+        "name": "amount",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
@@ -2572,6 +2686,17 @@
   },
   {
     "type": "error",
+    "name": "HookNotBound",
+    "inputs": [
+      {
+        "name": "boundHook",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "HookNotImplemented",
     "inputs": []
   },
@@ -2579,6 +2704,17 @@
     "type": "error",
     "name": "InvalidProof",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "LiquidityRestricted",
+    "inputs": [
+      {
+        "name": "sender",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
   },
   {
     "type": "error",

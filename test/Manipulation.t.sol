@@ -22,6 +22,21 @@ contract ManipulationTest is BaseTest {
 
     function setUp() public override {
         super.setUp();
+        // wide official liquidity, added while trading is still closed: a large buy reaches the gate 10 FDV
+        // while staying in range
+        initOfficialPool();
+        seedOfficialLiquidity();
+        int24 t = officialTick();
+        lpRouter.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tokenIs0 ? t - 600 : t - 60000,
+                tickUpper: tokenIs0 ? t + 60000 : t + 600,
+                liquidityDelta: 1e22,
+                salt: bytes32(uint256(1))
+            }),
+            ""
+        );
         fullLaunch();
         giveImd(alice, 1e24);
         giveImd(bob, 1e24);
@@ -33,18 +48,6 @@ contract ManipulationTest is BaseTest {
                 tickLower: REF_TICK - 40000,
                 tickUpper: REF_TICK + 40000,
                 liquidityDelta: 1e21,
-                salt: bytes32(uint256(1))
-            }),
-            ""
-        );
-        // wide official liquidity: a large buy reaches the gate 10 FDV while staying in range
-        int24 t = officialTick();
-        lpRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: tokenIs0 ? t - 600 : t - 60000,
-                tickUpper: tokenIs0 ? t + 60000 : t + 600,
-                liquidityDelta: 1e22,
                 salt: bytes32(uint256(1))
             }),
             ""
@@ -204,6 +207,20 @@ contract ManipulationTest is BaseTest {
         assertGt(last, imdUsdBefore * 19 / 10, "reached the new price within a day");
         (uint256 spot,) = hook.imdUsdPrice();
         assertLe(last, spot);
+    }
+
+    function test_trackerFollowsAtTheSameRateWithASwapEveryBlock() public {
+        uint256 seed = hook.trackedImdPerEth();
+        _moveReferenceTo(REF_TICK - 800); // IMD about 8% dearer: the tracker must fall toward spot
+        for (uint256 i; i < 300; i++) {
+            _nextBlock(12);
+            buy(alice, -1e18);
+        }
+        // one hour of 12-second updates, each bounded relative to the previous value: 5% compounded over
+        // 300 steps is (1 + 1/6000)^300, about 5.13%, not the 3% that whole-basis-point rounding gave
+        uint256 tracked = hook.trackedImdPerEth();
+        assertLe(tracked, seed * 10_000 / 10_500, "at least the 5% an hourly update allows");
+        assertGe(tracked, seed * 10_000 / 10_520, "no faster than the compounded bound");
     }
 
     function test_imdFallCountsImmediately() public {

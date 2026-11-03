@@ -43,11 +43,14 @@ as `factory()`.
 | 8 | `expectedChainId_` | `1` |
 
 The hook must be deployed at an address whose low bits equal `requiredAddressFlags()`
-(`BEFORE_INITIALIZE | BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA`
-= `0x20CC`). The constructor makes a low-level call to `token.registerHook(factory)`; the token accepts
+(`BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY | BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA |
+AFTER_SWAP_RETURNS_DELTA` = `0x28CC`; the manifest's permissions list must name `beforeAddLiquidity` as
+well). The constructor makes a low-level call to `token.registerHook(factory)`; the token accepts
 it only while the factory still holds the entire supply (that is, inside the launch transaction) and
 only once. The constructor never requires the token to have code, so launch pre-checks on an empty
-chain pass; `isBound()` reports whether the binding succeeded.
+chain pass; `isBound()` reports whether the binding succeeded, and `activate()` refuses
+(`HookNotBound`) unless `token.hook()` is this hook, so a launch whose binding failed or was taken by a
+stranger can never be sealed.
 
 Pool: `pool.pairedCurrency` IMD, `pool.fee` 12500, `pool.tickSpacing` 60, hooks = the hook. The hook's
 `beforeInitialize` accepts exactly this key (either currency order), only from the factory, only once.
@@ -84,12 +87,21 @@ forever: afterwards no setter works and nothing is owner-controlled.
 4. **Check references.** `hook.isReferenceAvailable()` must be true: the ETH/IMD v4 reference pool
    (PoolId `0xb07d640fd9e2eb9dc81b953c8e4fd006bdfeaf276010fb5418eb763ca15abfb3`, verified in
    `test_referencePoolIdMatchesMainnet`) initialized with positive liquidity and the Chainlink feed fresh.
-5. **Activate.** `hook.activate()`. Requirements: official pool initialized by the factory, chain id 1,
-   vault fully funded, feed decimals 8, valid IMD/USD and UNLK2/IMD prices. It credits the founder's
-   exactly 50m sell-rights allocation to the owner and opens trading.
+5. **Activate.** `hook.activate()`. Requirements: `token.hook()` is this hook (`isBound()`), official
+   pool initialized by the factory, chain id 1, vault fully funded, feed decimals 8, valid IMD/USD and
+   UNLK2/IMD prices. It credits the founder's exactly 50m sell-rights allocation to the owner (less any
+   UNLK2 the owner burned uncredited before activation, see "Burns") and opens trading. It does not check
+   that a swarm distributor or a router is set: an activation without them is permanent (no swarm claim
+   can ever be credited; every swap is attributed to its router contract), so check steps 2 and 3 first.
 
-Liquidity can be added while trading is closed (the hook has no liquidity callbacks). The factory's
-fee collection (`modifyLiquidity` with zero delta) is never intercepted.
+**Liquidity.** While trading is closed anyone may add liquidity to the official pool (the launch's own
+seeding, however the factory routes it). After activation only the factory itself (the direct caller of
+`PoolManager.modifyLiquidity`) may add; any other adder is refused (`LiquidityRestricted`). Otherwise a
+holder with 0% sell rights could park UNLK2 as a token-only range order just above the price, let buyers
+swap through it and remove it as IMD: an unmetered exit from the official pool. Removal, including the
+factory's zero-delta fee collection, is never intercepted, whoever the sender is. Liquidity that third
+parties added before activation is not metered either; the owner can read the pool's liquidity before
+sealing. Third-party pools remain outside these quotas, as the workflow states.
 
 ## Trading rules
 
@@ -117,9 +129,23 @@ exact-input shapes `1 - 0.99 * 0.9875 = 2.2375%`; exact-output shapes `1.01 / 0.
 and liquidity: an exact-input buy of X through the official pool returns exactly what `X - floor(X/100)`
 returns in the twin, and an exact-input sell returns exactly `Z - floor(Z/100)` of the twin's output Z.
 
+**Partial fills.** A swap stops early at its `sqrtPriceLimitX96` or when in-range liquidity runs out.
+For the two shapes whose fee is taken up front on the requested amount (exact-input buy, exact-output
+sell), Uniswap v4 cannot adjust the specified-side delta afterwards, so the hook recomputes the fee in
+`afterSwap` as `floor(E / 100)` of the executed pool IMD leg `E` and returns the difference to the
+trader (`PartialFillRefunded`): the trader's wallet receives the refund directly through
+`PoolManager.take`, outside the router's own settlement, so a router that checks its own balances does
+not see it. For a swap through an unregistered contract the refund goes to that contract, like its
+credits. The pot is only ever attributed the recomputed fee. The other two shapes already use the
+executed leg. The effective fee is therefore never above 1% of the executed IMD leg
+(`testFuzz_partialFillFeeNeverExceedsOnePercentOfExecuted`).
+
 The reward fee is minted to the hook as an ERC-6909 IMD claim inside the swap and attributed to the
 RewardPot in the same call (`RewardPot.onFeeAccrued`). Anyone may later call `redeemFees()` to move the
-IMD itself into the RewardPot; `claim()` redeems automatically when the pot holds too little.
+IMD itself into the RewardPot; `claim()` redeems automatically when the pot holds too little. Anyone can
+mint or transfer extra ERC-6909 IMD claims to the hook's address; `redeemFees()` attributes such a
+surplus as an ordinary reward fee (`SurplusClaimsAttributed`) before moving it, so a gift of 1 wei cannot
+make redemption or claims revert, and the gift belongs to the points holders.
 
 **Sell rights (official pool only).** Each account has separate buckets:
 
@@ -164,9 +190,16 @@ burn points and debit sell credits conservatively. Any holding origin may burn (
 
 Debit formula, in order:
 pending (unmatured) buys, then held buy credits (`buyCredited - buySold`), then held other credits
-(`otherCredited - otherSold`); whatever remains is uncredited balance. Sold counters never change, so
-a partially sold holding can end with zero allowance. `previewBurn(account, amount)` returns the exact
-debits and the allowance afterwards. Burns can never create or recycle eligibility.
+(`otherCredited - otherSold`); whatever remains is uncredited balance and is recorded in
+`uncreditedBurned[account]`. Sold counters never change, so a partially sold holding can end with zero
+allowance. `previewBurn(account, amount)` returns the exact debits and the allowance afterwards.
+
+Two credits are recorded later than the tokens arrive: a native swarm claim (credited by
+`creditSwarmClaim`, anyone may submit the evidence at any time) and the founder's 50m (credited at
+`activate()`). Each is netted against `uncreditedBurned` first (`CreditNetted`): burning before the
+credit is recorded gives exactly the same rights as burning after it, so the call order cannot keep a
+credit alive for tokens that no longer exist. Migration credits are recorded in the same call as the
+tokens and are not netted. Burns can never create or recycle eligibility.
 
 ## Gates
 
@@ -206,8 +239,11 @@ volume, not organic demand. Failed swaps, transfers and other pools are excluded
   replaced by the larger of the pool's spot and a rate-limited tracker (`trackedImdPerEth`). The tracker is
   seeded at activation and updated by swaps. It moves toward spot by at most 5% per hour of elapsed time
   (`REFERENCE_MOVE_BPS_PER_HOUR`), and one update can use at most 4 hours (`REFERENCE_MAX_GAP`), so at most
-  20%. IMD is therefore never valued above spot: a fall counts at once, a rise counts only as fast as the
-  tracker follows. The Chainlink ETH/USD part is not rate limited.
+  20%. The allowed move is computed at 1e18 precision (`RATE_PRECISION`), so a 12-second gap allows 1.67 bps
+  rather than a floored 1 bp: an update every block follows a held price at the same rate as sparse
+  updates. Each bound is relative to the previous tracked value, so many small updates compound to at most
+  (1 + 1/6000)^300 ≈ 5.13% per hour. IMD is therefore never valued above spot: a fall counts at once, a
+  rise counts only as fast as the tracker follows. The Chainlink ETH/USD part is not rate limited.
 - UNLK2/IMD = the official pool's `sqrtPriceX96` (either currency order).
 - FDV USD = price per UNLK2 in USD times the current `totalSupply()` (locked reserves included, burned
   supply excluded).
@@ -216,7 +252,10 @@ volume, not organic demand. Failed swaps, transfers and other pools are excluded
   the previous block left. `lastFdvUsd` records it. `fdvUsd()` and `imdUsdPrice()` are informational spot
   views and do not drive gates. There is no TWAP and no waiting period, and one reading can open several
   gates. The swap that triggers the reading is judged under the gates it opened. If no swap follows, the
-  gate opens with the next swap.
+  gate opens with the next swap. `sellAllowance()` and `contributionQuote()` report the stored gate count;
+  `pendingGatesOpen()` previews the count the block's first swap will be judged under. A frontend quoting
+  a sell or a contribution in a block that has not traded yet should read `pendingGatesOpen()` first: a
+  contribution quoted for gate N reverts `StaleGate` if that reading opens gate N before it lands.
 - An invalid price (stale feed, reverted feed, uninitialized or empty reference pool, wrong chain)
   skips price and volume progress for that swap only. Trading under already granted rights, migration
   and burns continue. The IMD leg of a swap made during an outage is not counted later, because no valid
@@ -231,7 +270,11 @@ volume, not organic demand. Failed swaps, transfers and other pools are excluded
   can then sell back. That needs real capital rather than a flash loan, and the position is exposed to the
   market for that one block, but a trader controlling consecutive blocks carries little of that risk. The
   brief asks for no TWAP or minimum duration, so none was added; deeper official liquidity raises the cost.
-  **This is a requester decision before release if a longer holding rule is wanted.**
+  Measured on the test fixture by the independent review: one exact-input buy that sweeps the in-range
+  liquidity, held for one block, then sold back, costs the swap fees of a few hundred IMD plus the
+  one-block market exposure (the partial-fill fee that made up most of the measured 10,111 IMD is now
+  refunded). Concentrated factory liquidity makes it cheaper, since past the range the price moves for
+  free. **This is a requester decision before release if a longer holding rule is wanted.**
 - *Repeated reference-pool pressure.* Pushing the reference pool at every update moves the tracker at most
   5% per hour, so reaching a 100x valuation takes about 94 hours of sustained, fee-paying pressure while
   ordinary swaps pull the tracker back. One update after a quiet period can move it 20%.
@@ -284,7 +327,8 @@ transfer that delivers less than `amount` (fee-on-transfer) reverts the migratio
 points: direct fees plus released pre-point pot), `totalRedeemed` (IMD moved in from the PoolManager),
 `totalPaid` (IMD claimed). Invariants, checked after every step of `testFuzz_rewardsConservedAndSolvent`:
 `paid <= vested <= accrued`, `redeemed <= accrued` (enforced in `onRedeemed`),
-`accrued - redeemed == hook.pendingFees()`, `IMD held >= redeemed - paid`, hence
+`accrued - redeemed <= hook.pendingFees()` (equal except between a third party's claim gift and the next
+redemption, which attributes the gift), `IMD held >= redeemed - paid`, hence
 `IMD held + pending claims >= accrued - paid` (`isSolvent()`), and the sum of all entitlements never
 exceeds `vested` (rounding is down, dust stays in the pot). `solvency()` returns all of them.
 
@@ -299,16 +343,19 @@ exceeds `vested` (rounding is down, dust stays in the pot). `solvency()` returns
 | Feed max age | 90 minutes | `UnlockV2Hook.MAX_FEED_AGE` |
 | Reference tracker rate | 5% per hour | `UnlockV2Hook.REFERENCE_MOVE_BPS_PER_HOUR` |
 | Reference tracker longest gap per update | 4 hours (so 20% at most) | `UnlockV2Hook.REFERENCE_MAX_GAP` |
+| Reference tracker move precision | 1e18 (fractional basis points kept) | `UnlockV2Hook.RATE_PRECISION` |
+| Liquidity after activation | factory only | `UnlockV2Hook.beforeAddLiquidity` |
 | FDV reading | once per block, before its first swap | `UnlockV2Hook._observeSettledFdv` |
 | Burn carry rule | none: excess contributions are rejected | `UnlockV2Hook.onContribute` |
 
 ## Callbacks implemented and why
 
-`beforeInitialize` (factory-only, exact key, once), `beforeSwap` + `beforeSwapReturnDelta` (trading
-gate, trader resolution, fee when IMD is the specified currency), `afterSwap` + `afterSwapReturnDelta`
-(fee when IMD is unspecified, sell-right debit / buy credit, volume observation). `beforeSwap` also takes
-the block's FDV reading. No
-liquidity or donate callbacks, so the factory's liquidity and fee collection are never blocked.
+`beforeInitialize` (factory-only, exact key, once), `beforeAddLiquidity` (open before activation,
+factory-only after it), `beforeSwap` + `beforeSwapReturnDelta` (trading gate, trader resolution, fee when
+IMD is the specified currency), `afterSwap` + `afterSwapReturnDelta` (fee when IMD is unspecified,
+partial-fill fee correction, sell-right debit / buy credit, volume observation). `beforeSwap` also takes
+the block's FDV reading. No remove-liquidity or donate callbacks, so the factory's fee collection and
+withdrawals are never blocked.
 
 ## Assumptions and operational responsibilities
 
@@ -340,7 +387,10 @@ delayed redemption, epoch maturity, no expiry, auto-redemption on claim, benefic
 hook-only bookkeeping, contribution stale-gate/excess/zero/race/FDV cases, Golden Vault, fee bases
 against a hookless twin pool, fuzzed conservation and solvency), `test/Manipulation.t.sol` (spikes inside
 one block open nothing, a price held across a block opens several gates at once, reference-pool spikes do
-not inflate FDV or volume, tracker rate and 20% cap, IMD falls counted at once, feed outage, credits per
-account).
+not inflate FDV or volume, tracker rate and 20% cap, per-block tracker rate, IMD falls counted at once,
+feed outage, credits per account), `test/Revision.t.sol` (surplus ERC-6909 claims cannot block redemption
+or claims, partial fills of the up-front-fee shapes, liquidity provision after activation, activation of
+an unbound hook refused, swarm and founder credits netted against earlier uncredited burns, migration
+credits not netted, the gate preview view).
 
 Run: `forge test` (fuzz seed pinned in `foundry.toml`).

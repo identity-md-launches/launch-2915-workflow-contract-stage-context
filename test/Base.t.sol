@@ -27,8 +27,9 @@ abstract contract BaseTest is Test {
     using PoolIdLibrary for PoolKey;
 
     address internal constant OWNER = 0x48E4E74fE1d0c14404cEB57B9fec5b21329C6ec9;
-    uint160 internal constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG
-        | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
+    uint160 internal constant FLAGS = Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
+        | Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
+        | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
 
     // official pool opens at ~1e-4 IMD per UNLK2 (tick +-92100), reference pool at ~2980 IMD per ETH
     int24 internal constant OFFICIAL_TICK_ABS = 92100;
@@ -139,8 +140,10 @@ abstract contract BaseTest is Test {
 
     /// @dev Mirrors the launch factory distribution and the owner's setup, then activates.
     function fullLaunch() internal {
-        initOfficialPool();
-        seedOfficialLiquidity();
+        if (!hook.poolInitialized()) {
+            initOfficialPool();
+            seedOfficialLiquidity();
+        }
         initReferencePool();
         seedReferenceLiquidity();
         // factory pays out: 100m swarm (kept here as stand-in distributor), 750m to owner
