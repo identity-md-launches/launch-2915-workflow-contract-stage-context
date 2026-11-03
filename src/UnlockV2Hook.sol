@@ -32,7 +32,10 @@ import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 ///   * enforces origin-bucketed sell rights that ten permanent gates unlock (FDV, gross IMD volume or burns);
 ///   * takes an extra 1% fee on the IMD leg of every swap, kept as IMD for the burn-points reward pot;
 ///   * prices FDV and volume on chain from the official pool, the ETH/IMD v4 reference pool and the
-///     Chainlink ETH/USD feed; invalid prices skip price/volume progress but never block trading.
+///     Chainlink ETH/USD feed; invalid prices skip price/volume progress but never block trading;
+///   * opens FDV gates only from the official price a previous block left behind, and values IMD no higher
+///     than a rate-limited tracker of the reference pool allows, so a price spike that is undone within
+///     one transaction cannot open a gate or inflate volume.
 /// It creates the MigrationVault and RewardPot in its constructor.
 contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     using StateLibrary for IPoolManager;
@@ -55,6 +58,10 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     uint24 public constant LP_FEE_FOUNDER_PIPS = 10000;
     uint24 public constant LP_FEE_PLATFORM_PIPS = 2500;
     uint256 public constant MAX_FEED_AGE = 90 minutes;
+    /// @notice Fastest the reference price tracker may follow the reference pool, per hour (5%).
+    uint256 public constant REFERENCE_MOVE_BPS_PER_HOUR = 500;
+    /// @notice Longest gap the tracker can use up in one update, so a single reading moves it at most 20%.
+    uint256 public constant REFERENCE_MAX_GAP = 4 hours;
     uint8 public constant FEED_DECIMALS = 8;
     /// @notice Sell allowance of official-pool buys before gate 1 (percent).
     uint256 public constant PRE_GATE_BUY_PCT = 20;
@@ -99,6 +106,12 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     uint256 public burnBaseline;
     uint256 public lastFdvUsd;
     uint256 public lastValidObservation;
+    /// @notice Block of the latest official-price FDV reading; at most one per block, before its first swap.
+    uint256 public lastFdvBlock;
+    /// @notice Rate-limited IMD per ETH (18 decimals) tracking the reference pool. Seeded at activation.
+    uint256 public trackedImdPerEth;
+    /// @notice Timestamp of the latest tracker update.
+    uint256 public trackedAt;
 
     mapping(address => bool) public isRouter;
     address public swarmDistributor;
@@ -297,6 +310,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
 
         activated = true;
         activatedAt = uint64(block.timestamp);
+        (trackedImdPerEth,) = _referenceSpot();
+        trackedAt = block.timestamp;
         rewardPot.activate();
         _rights[owner].otherCredited += uint128(FOUNDER_ALLOCATION);
         emit FounderCredited(owner, FOUNDER_ALLOCATION);
@@ -378,6 +393,7 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         bool exactInput = params.amountSpecified < 0;
         _ctxTrader = _resolveTrader(sender);
         _ctxIsSell = isSell;
+        _observeSettledFdv();
 
         // IMD is the specified currency on exact-input buys and exact-output sells: take the fee here.
         int128 feeSpecified = 0;
@@ -627,21 +643,21 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         }
     }
 
-    /// @notice USD per IMD (18 decimals) from the ETH/IMD v4 reference pool and the Chainlink ETH/USD feed.
+    /// @notice Spot USD per IMD (18 decimals) from the ETH/IMD v4 reference pool and the Chainlink ETH/USD
+    ///         feed. Informational: gates and volume use `gateImdUsdPrice()`.
     function imdUsdPrice() public view returns (uint256 price, bool valid) {
-        if (block.chainid != expectedChainId) return (0, false);
-        (uint256 ethUsd, bool feedOk) = _ethUsd();
-        if (!feedOk) return (0, false);
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(referencePoolId);
-        if (sqrtPriceX96 == 0) return (0, false);
-        if (poolManager.getLiquidity(referencePoolId) == 0) return (0, false);
-        // reference pool: currency0 = native ETH, currency1 = IMD; price = IMD per ETH (both 18 decimals)
-        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96);
-        uint256 imdPerEth = FullMath.mulDiv(priceX96, 1e18, FixedPoint96.Q96);
-        if (imdPerEth == 0) return (0, false);
-        // ethUsd has 8 decimals -> scale to 18, then USD/IMD = USD/ETH / (IMD/ETH)
-        price = FullMath.mulDiv(ethUsd * 1e10, 1e18, imdPerEth);
-        valid = price != 0;
+        (uint256 imdPerEth, bool ok) = _referenceSpot();
+        if (!ok) return (0, false);
+        return _toImdUsd(imdPerEth);
+    }
+
+    /// @notice USD per IMD (18 decimals) the next FDV reading or volume count would use: spot, capped by the
+    ///         rate-limited tracker, so it never exceeds spot and a momentary spike barely moves it.
+    function gateImdUsdPrice() public view returns (uint256 price, bool valid) {
+        (uint256 imdPerEth, bool ok) = _referenceSpot();
+        if (!ok) return (0, false);
+        uint256 tracked = _nextTracked(imdPerEth);
+        return _toImdUsd(tracked > imdPerEth ? tracked : imdPerEth);
     }
 
     /// @notice IMD per UNLK2 (18 decimals) from the official pool's current sqrt price.
@@ -659,7 +675,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         valid = price != 0;
     }
 
-    /// @notice Fully diluted value in USD (18 decimals): token price x current totalSupply (burned excluded).
+    /// @notice Spot fully diluted value in USD (18 decimals): token price x current totalSupply (burned
+    ///         excluded). Informational: gates read the settled FDV, recorded in `lastFdvUsd`.
     function fdvUsd() public view returns (uint256 fdv, bool valid) {
         (uint256 imdUsd, bool v1) = imdUsdPrice();
         (uint256 tokenImd, bool v2) = tokenPriceInImd();
@@ -701,22 +718,84 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         }
     }
 
-    function _observe(uint256 imdLeg) internal {
-        (uint256 imdUsd, bool v1) = imdUsdPrice();
+    /// @dev IMD per ETH from the reference pool: currency0 = native ETH, currency1 = IMD, both 18 decimals.
+    function _referenceSpot() internal view returns (uint256 imdPerEth, bool valid) {
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(referencePoolId);
+        if (sqrtPriceX96 == 0) return (0, false);
+        if (poolManager.getLiquidity(referencePoolId) == 0) return (0, false);
+        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96);
+        imdPerEth = FullMath.mulDiv(priceX96, 1e18, FixedPoint96.Q96);
+        valid = imdPerEth != 0;
+    }
+
+    function _toImdUsd(uint256 imdPerEth) internal view returns (uint256 price, bool valid) {
+        if (block.chainid != expectedChainId) return (0, false);
+        (uint256 ethUsd, bool feedOk) = _ethUsd();
+        if (!feedOk) return (0, false);
+        // ethUsd has 8 decimals -> scale to 18, then USD/IMD = USD/ETH / (IMD/ETH)
+        price = FullMath.mulDiv(ethUsd * 1e10, 1e18, imdPerEth);
+        valid = price != 0;
+    }
+
+    /// @dev The tracker moved toward `spot`, by at most REFERENCE_MOVE_BPS_PER_HOUR of the time since its last
+    ///      update (gap capped at REFERENCE_MAX_GAP). Same timestamp: no movement.
+    function _nextTracked(uint256 spot) internal view returns (uint256) {
+        uint256 tracked = trackedImdPerEth;
+        uint256 gap = block.timestamp - trackedAt;
+        if (gap > REFERENCE_MAX_GAP) gap = REFERENCE_MAX_GAP;
+        uint256 moveBps = gap * REFERENCE_MOVE_BPS_PER_HOUR / 1 hours;
+        uint256 upper = FullMath.mulDiv(tracked, BPS + moveBps, BPS);
+        uint256 lower = FullMath.mulDiv(tracked, BPS, BPS + moveBps);
+        if (spot > upper) return upper;
+        if (spot < lower) return lower;
+        return spot;
+    }
+
+    /// @dev USD per IMD for gates and volume, updating the tracker. IMD per ETH is the larger of spot and
+    ///      tracker, so IMD is valued at the lower of the two: an IMD spike must persist to count, an IMD
+    ///      fall counts at once.
+    function _settleImdUsd() internal returns (uint256 imdUsd, bool valid) {
+        (uint256 imdPerEth, bool ok) = _referenceSpot();
+        if (!ok) return (0, false);
+        uint256 tracked = _nextTracked(imdPerEth);
+        if (block.timestamp != trackedAt) {
+            trackedImdPerEth = tracked;
+            trackedAt = block.timestamp;
+        }
+        return _toImdUsd(tracked > imdPerEth ? tracked : imdPerEth);
+    }
+
+    /// @dev Runs before the swap moves the price, once per block. Every official swap passes through this
+    ///      hook, so on the first swap of a block the pool still shows the price the previous block left:
+    ///      a spike bought and sold back within one block is never read, and one held over a block
+    ///      boundary carries the holder's market risk for that time.
+    function _observeSettledFdv() internal {
+        if (lastFdvBlock == block.number) return;
+        lastFdvBlock = block.number;
+        if (gatesOpen >= GATE_COUNT) return;
+        (uint256 imdUsd, bool v1) = _settleImdUsd();
         (uint256 tokenImd, bool v2) = tokenPriceInImd();
-        if (!v1 || !v2) {
+        if (!v1 || !v2) return;
+        uint256 usdPerToken = FullMath.mulDiv(tokenImd, imdUsd, 1e18);
+        uint256 fdv = FullMath.mulDiv(usdPerToken, token.totalSupply(), 1e18);
+        lastFdvUsd = fdv;
+        _advanceGates(fdv, true);
+    }
+
+    /// @dev Counts the executed IMD leg once at the current gate USD price. Gates opened by FDV were already
+    ///      evaluated in `_observeSettledFdv`; only the volume threshold can newly apply here.
+    function _observe(uint256 imdLeg) internal {
+        (uint256 imdUsd, bool valid) = _settleImdUsd();
+        if (!valid) {
             emit Observation(false, 0, 0, 0);
             _advanceGates(0, false);
             return;
         }
         uint256 volumeAdded = FullMath.mulDiv(imdLeg, imdUsd, 1e18);
         cumulativeVolumeUsd += volumeAdded;
-        uint256 usdPerToken = FullMath.mulDiv(tokenImd, imdUsd, 1e18);
-        uint256 fdv = FullMath.mulDiv(usdPerToken, token.totalSupply(), 1e18);
-        lastFdvUsd = fdv;
         lastValidObservation = block.timestamp;
-        emit Observation(true, imdUsd, fdv, volumeAdded);
-        _advanceGates(fdv, true);
+        emit Observation(true, imdUsd, lastFdvUsd, volumeAdded);
+        _advanceGates(0, false);
     }
 
     /// @dev Opens every sequential gate whose FDV, volume or contribution threshold is met.

@@ -1,5 +1,6 @@
-> This copy supersedes the root README.md for the burn, contribution, fee and reward sections
-> (the root file is outside this contribution's write scope and still describes the earlier reward pot).
+> This copy supersedes the root README.md for the burn, contribution, fee, reward and pricing sections
+> (the root file is outside this contribution's write scope and still describes the earlier reward pot
+> and spot-only gate pricing).
 
 # UNLOCK V2 (UNLK2) — token, hook, migration vault, burn points and weekly rewards
 
@@ -136,8 +137,18 @@ uncredited tokens. These quotas govern the official pool; third-party pools are 
 never trusted.
 
 **Shared-account limitation.** A swap through an unregistered contract credits and debits that
-contract's buckets, so all of its users share one allowance (tested in
-`test_unregisteredRouterIsOneSharedAccount`). Users should trade through the registered routers.
+contract's buckets, so all of its users share one allowance: one user's buy creates allowance another
+user can spend (tested in `test_unregisteredRouterIsOneSharedAccount`). Users should trade through the
+registered routers. Registration ends at activation, so a router deployed later can never be added and
+its users share one bucket until gate 10. Register only routers whose `msgSender()` is known to report
+the real caller.
+
+**Credits belong to accounts, not tokens.** Rights are counters on the account and transfers do not move
+them (there is no transfer hook). An account that sends its tokens away keeps its allowance and can later
+sell tokens it receives from anyone, including tokens that earned no credit. The receiver of a transfer
+never gains eligibility, and total official-pool selling stays bounded by the sum of credits times the
+unlocked percentage, so this is not an aggregate quota bypass
+(`test_creditedAccountCanSellTokensReceivedFromOthers`).
 
 **Burns.** Two burn paths, both irreversible (never refunded), both reduce `totalSupply`, credit `amount`
 burn points and debit sell credits conservatively. Any holding origin may burn (credited or not).
@@ -173,34 +184,64 @@ debits and the allowance afterwards. Burns can never create or recycle eligibili
 | 10 | 100 | 25,000,000 | 20,000,000 | 2,000,000 |
 
 Any one threshold opens its gate, forever. Gates open sequentially; one observation can open several.
-Falling prices never relock. Volume accumulates from activation and never resets. Burn targets are per
+FDV is read once per block, before that block's first official swap (see "On-chain pricing"), so a buy
+that lifts the FDV opens its gates on the first swap of a later block, not in its own swap. Volume and
+contributions open gates immediately. Falling prices never relock. Volume accumulates from activation and never resets. Burn targets are per
 gate and only contributions count (`gateBurned`; `totalBurned` counts every burn). A contribution can
 never exceed the open gate's remainder, so a burn-opened gate leaves nothing to carry; when a gate opens
 by FDV or volume the next gate's burn counter starts from zero. Contributions already made are not
 refunded and their points survive.
 
 **Volume** counts each successful official swap's executed IMD leg (the pool's IMD delta, excluding
-the hook fee) once, converted to USD at execution. Repeated same-account trades count. This is gross
+the hook fee) once, converted to USD at execution with the gate IMD price below. Repeated same-account trades count. This is gross
 volume, not organic demand. Failed swaps, transfers and other pools are excluded.
 
 ## On-chain pricing
 
-- IMD/USD = Chainlink ETH/USD (8 decimals, `answer > 0`, `updatedAt` within 90 minutes and not in
-  the future, `answeredInRound >= roundId`, decimals checked at activation) divided by IMD-per-ETH from
-  the v4 reference pool (native ETH / IMD, fee 10000, tickSpacing 200, hooks zero; `sqrtPriceX96 != 0`
-  and positive liquidity required). Chain id must equal `expectedChainId`.
-- UNLK2/IMD = the official pool's current `sqrtPriceX96` (either currency order).
+- Spot IMD/USD (`imdUsdPrice()`) = Chainlink ETH/USD (8 decimals, `answer > 0`, `updatedAt` within 90
+  minutes and not in the future, `answeredInRound >= roundId`, decimals checked at activation) divided by
+  IMD-per-ETH from the v4 reference pool (native ETH / IMD, fee 10000, tickSpacing 200, hooks zero;
+  `sqrtPriceX96 != 0` and positive liquidity required). Chain id must equal `expectedChainId`.
+- Gate IMD/USD (`gateImdUsdPrice()`, used for FDV gates and volume) = the same formula with IMD-per-ETH
+  replaced by the larger of the pool's spot and a rate-limited tracker (`trackedImdPerEth`). The tracker is
+  seeded at activation and updated by swaps. It moves toward spot by at most 5% per hour of elapsed time
+  (`REFERENCE_MOVE_BPS_PER_HOUR`), and one update can use at most 4 hours (`REFERENCE_MAX_GAP`), so at most
+  20%. IMD is therefore never valued above spot: a fall counts at once, a rise counts only as fast as the
+  tracker follows. The Chainlink ETH/USD part is not rate limited.
+- UNLK2/IMD = the official pool's `sqrtPriceX96` (either currency order).
 - FDV USD = price per UNLK2 in USD times the current `totalSupply()` (locked reserves included, burned
   supply excluded).
+- **When FDV is read.** Once per block (`lastFdvBlock`), at the start of that block's first official swap,
+  before the swap moves the price. All official swaps pass through this hook, so that reading is the price
+  the previous block left. `lastFdvUsd` records it. `fdvUsd()` and `imdUsdPrice()` are informational spot
+  views and do not drive gates. There is no TWAP and no waiting period, and one reading can open several
+  gates. The swap that triggers the reading is judged under the gates it opened. If no swap follows, the
+  gate opens with the next swap.
 - An invalid price (stale feed, reverted feed, uninitialized or empty reference pool, wrong chain)
   skips price and volume progress for that swap only. Trading under already granted rights, migration
-  and burns continue. No TWAP or waiting requirement.
+  and burns continue. The IMD leg of a swap made during an outage is not counted later, because no valid
+  USD price existed at its execution and the brief converts at execution. Gross volume therefore
+  undercounts during outages and never overcounts.
 
-**Spot-manipulation disclosure.** Both prices are spot readings. A large swap in the official pool or
-in the ETH/IMD reference pool within one transaction moves the observed FDV and the USD value of
-volume, and gates once open never close. A deep-pocketed trader can therefore open gates early by
-pushing the price (paying the 1.25% LP fee, the 1% hook fee and the price impact); the fuzz test
-shows a single large buy can open all gates. This is an accepted property of the requested design.
+**Manipulation disclosure.** A price spike that is undone within one block cannot open an FDV gate
+(`test/Manipulation.t.sol`), in either pool. What remains:
+
+- *Holding across a block boundary.* A buy left in place until the next block's first swap is a valid
+  reading and can open every gate up to gate 10, permanently, after which all quotas are gone. The buyer
+  can then sell back. That needs real capital rather than a flash loan, and the position is exposed to the
+  market for that one block, but a trader controlling consecutive blocks carries little of that risk. The
+  brief asks for no TWAP or minimum duration, so none was added; deeper official liquidity raises the cost.
+  **This is a requester decision before release if a longer holding rule is wanted.**
+- *Repeated reference-pool pressure.* Pushing the reference pool at every update moves the tracker at most
+  5% per hour, so reaching a 100x valuation takes about 94 hours of sustained, fee-paying pressure while
+  ordinary swaps pull the tracker back. One update after a quiet period can move it 20%.
+- *Griefing and lag.* Pushing IMD down in the reference pool lowers the valuation for that swap and pulls
+  the tracker the same bounded way, delaying FDV and volume progress, not opening anything. After a real
+  IMD rise, valuations lag spot, so gates can open later than spot implies, never earlier.
+- *Activation.* The tracker seed is the reference spot at `activate()`. A swap bundled around that one
+  transaction could skew the seed; the tracker then corrects at its normal rate.
+- *Wash volume.* Repeated fee-paying trades count by design, so the volume path can be bought at the cost
+  of fees (about 2.24% of the volume per swap at current fee rates). It is labelled gross volume.
 
 ## Migration
 
@@ -256,13 +297,17 @@ exceeds `vested` (rounding is down, dust stays in the pot). `solvency()` returns
 | Reward accumulator precision | 1e36 | `RewardPot.ACC_PRECISION` |
 | Buy maturity | 1 block | `UnlockV2Hook._mature` |
 | Feed max age | 90 minutes | `UnlockV2Hook.MAX_FEED_AGE` |
+| Reference tracker rate | 5% per hour | `UnlockV2Hook.REFERENCE_MOVE_BPS_PER_HOUR` |
+| Reference tracker longest gap per update | 4 hours (so 20% at most) | `UnlockV2Hook.REFERENCE_MAX_GAP` |
+| FDV reading | once per block, before its first swap | `UnlockV2Hook._observeSettledFdv` |
 | Burn carry rule | none: excess contributions are rejected | `UnlockV2Hook.onContribute` |
 
 ## Callbacks implemented and why
 
 `beforeInitialize` (factory-only, exact key, once), `beforeSwap` + `beforeSwapReturnDelta` (trading
 gate, trader resolution, fee when IMD is the specified currency), `afterSwap` + `afterSwapReturnDelta`
-(fee when IMD is unspecified, sell-right debit / buy credit, price and volume observation). No
+(fee when IMD is unspecified, sell-right debit / buy credit, volume observation). `beforeSwap` also takes
+the block's FDV reading. No
 liquidity or donate callbacks, so the factory's liquidity and fee collection are never blocked.
 
 ## Assumptions and operational responsibilities
@@ -293,6 +338,9 @@ swarm evidence, gate table, volume/burn gate logic, fuzz monotonicity), `test/Re
 (pre-point pot and its 7-day release, epoch-boundary split, immediate accrual, no retroactive rewards,
 delayed redemption, epoch maturity, no expiry, auto-redemption on claim, beneficiary-only claims and
 hook-only bookkeeping, contribution stale-gate/excess/zero/race/FDV cases, Golden Vault, fee bases
-against a hookless twin pool, fuzzed conservation and solvency).
+against a hookless twin pool, fuzzed conservation and solvency), `test/Manipulation.t.sol` (spikes inside
+one block open nothing, a price held across a block opens several gates at once, reference-pool spikes do
+not inflate FDV or volume, tracker rate and 20% cap, IMD falls counted at once, feed outage, credits per
+account).
 
 Run: `forge test` (fuzz seed pinned in `foundry.toml`).
