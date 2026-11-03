@@ -123,6 +123,6 @@ contract HookHarness is UnlockV2Hook {
     }
 
     function addBurn(uint256 amount) external {
-        totalBurned += amount;
+        gateBurned += amount;
     }
 }

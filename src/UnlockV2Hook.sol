@@ -50,6 +50,10 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     /// @notice Extra hook fee on the IMD leg of every official swap, in basis points (1%).
     uint256 public constant HOOK_FEE_BPS = 100;
     uint256 public constant BPS = 10_000;
+    /// @notice The official pool's LP fee in pips (1.25%), split by the launch as 1% founder + 0.25% platform.
+    uint24 public constant LP_FEE_PIPS = 12500;
+    uint24 public constant LP_FEE_FOUNDER_PIPS = 10000;
+    uint24 public constant LP_FEE_PLATFORM_PIPS = 2500;
     uint256 public constant MAX_FEED_AGE = 90 minutes;
     uint8 public constant FEED_DECIMALS = 8;
     /// @notice Sell allowance of official-pool buys before gate 1 (percent).
@@ -86,7 +90,12 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     uint8 public gatesOpen;
     /// @notice Gross official volume (executed IMD legs at execution USD), 18 decimals, never reset.
     uint256 public cumulativeVolumeUsd;
+    /// @notice Every UNLK2 burned through the token (gate contributions plus voluntary burns).
     uint256 public totalBurned;
+    /// @notice UNLK2 burned as gate contributions (the only burns that count toward gate burn targets).
+    uint256 public gateBurned;
+    /// @notice `gateBurned` at the moment the latest gate opened; progress toward the next gate is
+    ///         `gateBurned - burnBaseline`.
     uint256 public burnBaseline;
     uint256 public lastFdvUsd;
     uint256 public lastValidObservation;
@@ -125,6 +134,8 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     event FounderCredited(address indexed account, uint256 amount);
     event BurnDebited(address indexed account, uint256 amount, uint256 fromPending, uint256 fromBuy, uint256 fromOther);
     event HookFeeCollected(uint256 amount, bool isSell);
+    event Contributed(address indexed account, uint8 indexed gate, uint256 amount, uint256 progressAfter);
+    event VoluntaryBurn(address indexed account, uint256 amount);
     event FeesRedeemed(uint256 amount);
     event Observation(bool valid, uint256 imdUsd, uint256 fdvUsd, uint256 volumeUsdAdded);
 
@@ -154,6 +165,10 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     error InvalidProof();
     error ZeroAddress();
     error NotRedeeming();
+    error ZeroAmount();
+    error StaleGate(uint8 expected, uint8 current);
+    error ExceedsGateRemaining(uint256 amount, uint256 remaining);
+    error GoldenVaultOpen();
 
     // ------------------------------------------------------------------ modifiers
 
@@ -282,6 +297,7 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
 
         activated = true;
         activatedAt = uint64(block.timestamp);
+        rewardPot.activate();
         _rights[owner].otherCredited += uint128(FOUNDER_ALLOCATION);
         emit FounderCredited(owner, FOUNDER_ALLOCATION);
         emit Activated(block.timestamp, price);
@@ -367,9 +383,10 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         int128 feeSpecified = 0;
         if ((!isSell && exactInput) || (isSell && !exactInput)) {
             uint256 amount = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-            uint256 fee = amount * HOOK_FEE_BPS / BPS;
+            uint256 fee = hookFee(amount);
             if (fee != 0) {
                 poolManager.mint(address(this), Currency.wrap(imd).toId(), fee);
+                rewardPot.onFeeAccrued(fee);
                 feeSpecified = fee.toInt128();
                 emit HookFeeCollected(fee, isSell);
             }
@@ -396,9 +413,10 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         // IMD is the unspecified currency on exact-input sells and exact-output buys: take the fee here.
         int128 feeUnspecified = 0;
         if ((isSell && exactInput) || (!isSell && !exactInput)) {
-            uint256 fee = imdLeg * HOOK_FEE_BPS / BPS;
+            uint256 fee = hookFee(imdLeg);
             if (fee != 0) {
                 poolManager.mint(address(this), Currency.wrap(imd).toId(), fee);
+                rewardPot.onFeeAccrued(fee);
                 feeUnspecified = fee.toInt128();
                 emit HookFeeCollected(fee, isSell);
             }
@@ -425,12 +443,29 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
     // ------------------------------------------------------------------ companions
 
     /// @inheritdoc IUnlockV2Hook
+    /// @dev Voluntary burn: earns points and debits sell credits, never counts toward a gate.
     function onBurn(address account, uint256 amount) external {
         if (msg.sender != address(token)) revert NotToken();
-        totalBurned += amount;
-        _debitBurn(account, amount);
-        rewardPot.addPoints(account, amount);
-        _advanceGates(lastFdvUsd, false);
+        _recordBurn(account, amount);
+        emit VoluntaryBurn(account, amount);
+    }
+
+    /// @inheritdoc IUnlockV2Hook
+    /// @dev Gate contribution. Reverts (and with it the token's burn) when `expectedGate` is not the
+    ///      gate currently collecting burns, when `amount` exceeds what that gate still needs, or when
+    ///      gate 10 is open. Excess is never carried silently into a later gate.
+    function onContribute(address account, uint8 expectedGate, uint256 amount) external {
+        if (msg.sender != address(token)) revert NotToken();
+        if (amount == 0) revert ZeroAmount();
+        if (gatesOpen >= GATE_COUNT) revert GoldenVaultOpen();
+        uint8 current = gatesOpen + 1;
+        if (expectedGate != current) revert StaleGate(expectedGate, current);
+        uint256 remaining = gateBurnRemaining();
+        if (amount > remaining) revert ExceedsGateRemaining(amount, remaining);
+        _recordBurn(account, amount);
+        gateBurned += amount;
+        emit Contributed(account, current, amount, gateBurned - burnBaseline);
+        _advanceGates(0, false);
     }
 
     /// @inheritdoc IUnlockV2Hook
@@ -466,7 +501,7 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         _redeeming = true;
         poolManager.unlock(abi.encode(amount));
         _redeeming = false;
-        rewardPot.notifyDeposit(amount);
+        rewardPot.onRedeemed(amount);
         emit FeesRedeemed(amount);
     }
 
@@ -505,9 +540,49 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         revert("bad gate");
     }
 
-    /// @notice Burns counted toward the next gate.
-    function burnProgress() external view returns (uint256) {
-        return totalBurned - burnBaseline;
+    /// @notice Contributions counted toward the gate currently collecting burns.
+    function burnProgress() public view returns (uint256) {
+        return gateBurned - burnBaseline;
+    }
+
+    /// @notice UNLK2 the gate currently collecting burns still accepts (0 once gate 10 is open).
+    function gateBurnRemaining() public view returns (uint256) {
+        if (gatesOpen >= GATE_COUNT) return 0;
+        (,,, uint256 burnT) = gate(gatesOpen + 1);
+        uint256 progress = burnProgress();
+        return burnT > progress ? burnT - progress : 0;
+    }
+
+    /// @notice What a contribution must pass right now: `token.contribute(expectedGate, amount)` with
+    ///         `amount <= maxAmount`. `expectedGate` is 0 and `maxAmount` 0 once the Golden Vault is open.
+    function contributionQuote() external view returns (uint8 expectedGate, uint256 maxAmount) {
+        if (gatesOpen >= GATE_COUNT) return (0, 0);
+        return (gatesOpen + 1, gateBurnRemaining());
+    }
+
+    /// @notice True once gate 10 is open: no more gates or contributions, voluntary burns still earn points.
+    function goldenVaultOpen() external view returns (bool) {
+        return gatesOpen >= GATE_COUNT;
+    }
+
+    /// @notice The 1% reward fee on an IMD amount, rounded down. Its base depends on the swap shape:
+    ///         exact-input buy: the trader's gross IMD input; exact-output buy: the pool's IMD input
+    ///         (trader pays it plus the fee); exact-input sell: the pool's IMD output (trader receives it
+    ///         minus the fee); exact-output sell: the trader's requested IMD output (the pool delivers it
+    ///         plus the fee).
+    function hookFee(uint256 imdAmount) public pure returns (uint256) {
+        return imdAmount * HOOK_FEE_BPS / BPS;
+    }
+
+    /// @notice (LP fee pips, founder pips, platform pips, reward fee bps). The LP fee is charged by the
+    ///         pool on the swap input currency; the reward fee on the IMD leg. Different bases: they do
+    ///         not simply add to 2.25%.
+    function feeSchedule()
+        external
+        pure
+        returns (uint24 lpFeePips, uint24 founderPips, uint24 platformPips, uint256 rewardFeeBps)
+    {
+        return (LP_FEE_PIPS, LP_FEE_FOUNDER_PIPS, LP_FEE_PLATFORM_PIPS, HOOK_FEE_BPS);
     }
 
     /// @notice Current unlocked percentages for (official buys, other credited origins).
@@ -644,20 +719,22 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         _advanceGates(fdv, true);
     }
 
-    /// @dev Opens every sequential gate whose FDV, volume or burn threshold is met. reason: 1 burn, 2 fdv, 3 volume.
+    /// @dev Opens every sequential gate whose FDV, volume or contribution threshold is met.
+    ///      reason: 1 burn, 2 fdv, 3 volume.
     function _advanceGates(uint256 fdv, bool priceValid) internal {
         while (gatesOpen < GATE_COUNT) {
             uint8 next = gatesOpen + 1;
             (, uint256 fdvT, uint256 volT, uint256 burnT) = gate(next);
             uint8 reason = 0;
-            if (totalBurned - burnBaseline >= burnT) reason = 1;
+            if (gateBurned - burnBaseline >= burnT) reason = 1;
             else if (priceValid && fdv >= fdvT) reason = 2;
             else if (cumulativeVolumeUsd >= volT) reason = 3;
             if (reason == 0) break;
-            if (reason == 1) burnBaseline += burnT;
-            else burnBaseline = totalBurned;
+            // contributions never exceed the open gate's remaining target, so nothing carries over;
+            // a gate opened by FDV or volume starts the next gate's burn count from zero (points stay).
+            burnBaseline = gateBurned;
             gatesOpen = next;
-            emit GateOpened(next, reason, fdv, cumulativeVolumeUsd, totalBurned);
+            emit GateOpened(next, reason, fdv, cumulativeVolumeUsd, gateBurned);
         }
     }
 
@@ -725,6 +802,12 @@ contract UnlockV2Hook is IHooks, IUnlockCallback, IUnlockV2Hook {
         rem -= fromBuy;
         uint256 heldOther = r.otherCredited > r.otherSold ? r.otherCredited - r.otherSold : 0;
         fromOther = rem < heldOther ? rem : heldOther;
+    }
+
+    function _recordBurn(address account, uint256 amount) internal {
+        totalBurned += amount;
+        _debitBurn(account, amount);
+        rewardPot.addPoints(account, amount);
     }
 
     function _debitBurn(address account, uint256 amount) internal {

@@ -70,8 +70,10 @@ contract TradingTest is BaseTest {
         assertEq(redeemed, 10e18);
         assertEq(hook.pendingFees(), 0);
         assertEq(imd.balanceOf(address(pot)), 10e18);
-        assertEq(pot.streamTotal(), 10e18);
-        assertEq(pot.streamEnd(), vm.getBlockTimestamp() + 7 days);
+        assertEq(pot.totalRedeemed(), 10e18);
+        // the fee was attributed when earned (before the redemption), into the pre-point pot
+        assertEq(pot.totalAccrued(), 10e18);
+        assertEq(pot.prePointPot(), 10e18);
         vm.expectRevert(UnlockV2Hook.NothingToRedeem.selector);
         hook.redeemFees();
     }
@@ -225,16 +227,22 @@ contract TradingTest is BaseTest {
     }
 
     function test_gateOpensByBurnAndGate10BypassesQuotas() public {
-        // gate 1 by burn: 25m from the owner's remainder
+        // gate 1 by contribution: 25m from the owner's remainder
         vm.prank(OWNER);
-        token.burn(25_000_000e18);
+        token.contribute(1, 25_000_000e18);
         assertEq(hook.gatesOpen(), 1);
         assertEq(hook.burnProgress(), 0);
-        // burn the rest of the targets: 22+19+16+13+10+8+6+4+2 = 100m (from the swarm stand-in balance)
+        // contribute the rest of the targets gate by gate: 22+19+16+13+10+8+6+4+2 = 100m
         token.transfer(alice, 100_000_000e18);
-        vm.prank(alice);
-        token.burn(100_000_000e18);
+        for (uint8 g = 2; g <= 10; g++) {
+            (uint8 expected, uint256 maxAmount) = hook.contributionQuote();
+            assertEq(expected, g);
+            vm.prank(alice);
+            token.contribute(g, maxAmount);
+        }
         assertEq(hook.gatesOpen(), 10);
+        assertTrue(hook.goldenVaultOpen());
+        assertEq(token.balanceOf(alice), 0);
         assertEq(hook.sellAllowance(alice), type(uint256).max);
         // uncredited tokens (plain transfer) sell freely
         vm.prank(OWNER);

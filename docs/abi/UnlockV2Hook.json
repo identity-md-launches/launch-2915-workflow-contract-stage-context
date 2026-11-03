@@ -112,6 +112,45 @@
   },
   {
     "type": "function",
+    "name": "LP_FEE_FOUNDER_PIPS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint24",
+        "internalType": "uint24"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "LP_FEE_PIPS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint24",
+        "internalType": "uint24"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "LP_FEE_PLATFORM_PIPS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint24",
+        "internalType": "uint24"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MAX_FEED_AGE",
     "inputs": [],
     "outputs": [
@@ -1103,6 +1142,24 @@
   },
   {
     "type": "function",
+    "name": "contributionQuote",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "expectedGate",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "maxAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "creditMigration",
     "inputs": [
       {
@@ -1219,6 +1276,34 @@
   },
   {
     "type": "function",
+    "name": "feeSchedule",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "lpFeePips",
+        "type": "uint24",
+        "internalType": "uint24"
+      },
+      {
+        "name": "founderPips",
+        "type": "uint24",
+        "internalType": "uint24"
+      },
+      {
+        "name": "platformPips",
+        "type": "uint24",
+        "internalType": "uint24"
+      },
+      {
+        "name": "rewardFeeBps",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
     "name": "gate",
     "inputs": [
       {
@@ -1250,6 +1335,32 @@
       }
     ],
     "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "gateBurnRemaining",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "gateBurned",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -1345,6 +1456,38 @@
             "internalType": "bool"
           }
         ]
+      }
+    ],
+    "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "goldenVaultOpen",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "hookFee",
+    "inputs": [
+      {
+        "name": "imdAmount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "pure"
@@ -1485,6 +1628,29 @@
         "name": "account",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "onContribute",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "expectedGate",
+        "type": "uint8",
+        "internalType": "uint8"
       },
       {
         "name": "amount",
@@ -1986,6 +2152,37 @@
   },
   {
     "type": "event",
+    "name": "Contributed",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "gate",
+        "type": "uint8",
+        "indexed": true,
+        "internalType": "uint8"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "progressAfter",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "FeesRedeemed",
     "inputs": [
       {
@@ -2230,6 +2427,25 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "VoluntaryBurn",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "AlreadyInitialized",
     "inputs": []
@@ -2241,6 +2457,22 @@
   },
   {
     "type": "error",
+    "name": "ExceedsGateRemaining",
+    "inputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "remaining",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "FeedDecimalsMismatch",
     "inputs": [
       {
@@ -2249,6 +2481,11 @@
         "internalType": "uint8"
       }
     ]
+  },
+  {
+    "type": "error",
+    "name": "GoldenVaultOpen",
+    "inputs": []
   },
   {
     "type": "error",
@@ -2349,6 +2586,22 @@
   },
   {
     "type": "error",
+    "name": "StaleGate",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "current",
+        "type": "uint8",
+        "internalType": "uint8"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "SwarmClaimNotFound",
     "inputs": []
   },
@@ -2392,6 +2645,11 @@
   {
     "type": "error",
     "name": "ZeroAddress",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ZeroAmount",
     "inputs": []
   }
 ]

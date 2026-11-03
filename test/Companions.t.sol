@@ -5,7 +5,6 @@ import {BaseTest} from "./Base.t.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {UnlockV2Hook} from "../src/UnlockV2Hook.sol";
 import {MigrationVault} from "../src/MigrationVault.sol";
-import {RewardPot} from "../src/RewardPot.sol";
 import {MockDistributor, HookHarness} from "./utils/Mocks.sol";
 
 contract CompanionsTest is BaseTest {
@@ -107,81 +106,6 @@ contract CompanionsTest is BaseTest {
         hook.creditSwarmClaim(0, alice, 10e18, proof);
     }
 
-    // ------------------------------------------------------------------ reward pot
-
-    function test_rewardPot_streamsOverSevenDaysAndWeeklyClaims() public {
-        fullLaunch();
-        token.transfer(alice, 100e18);
-        token.transfer(bob, 300e18);
-        vm.prank(alice);
-        token.burn(100e18);
-        vm.prank(bob);
-        token.burn(300e18);
-        assertEq(pot.totalPoints(), 400e18);
-
-        giveImd(alice, 1e24);
-        buy(alice, -1000e18); // 10 IMD fee
-        hook.redeemFees();
-        assertEq(pot.claimable(alice), 0);
-
-        vm.warp(vm.getBlockTimestamp() + 3.5 days);
-        assertApproxEqAbs(pot.claimable(alice), 1.25e18, 1e6);
-        assertApproxEqAbs(pot.claimable(bob), 3.75e18, 1e6);
-
-        vm.prank(alice);
-        uint256 got = pot.claim();
-        assertApproxEqAbs(got, 1.25e18, 1e6);
-        assertEq(imd.balanceOf(alice), 1e24 - 1000e18 + got);
-
-        // second claim in the same epoch is refused
-        vm.prank(alice);
-        vm.expectRevert();
-        pot.claim();
-
-        // after the full stream, bob claims everything that accrued to him
-        vm.warp(vm.getBlockTimestamp() + 4 days);
-        vm.prank(bob);
-        uint256 gotBob = pot.claim();
-        assertApproxEqAbs(gotBob, 7.5e18, 1e6);
-        // alice in a new epoch claims the rest
-        vm.prank(alice);
-        uint256 got2 = pot.claim();
-        assertApproxEqAbs(got + got2, 2.5e18, 1e6);
-        assertLe(got + got2 + gotBob, 10e18);
-    }
-
-    function test_rewardPot_noPointsHoldsUndistributed() public {
-        fullLaunch();
-        giveImd(alice, 1e24);
-        buy(alice, -1000e18);
-        hook.redeemFees();
-        vm.warp(vm.getBlockTimestamp() + 7 days);
-        pot.checkpoint();
-        assertEq(pot.undistributed(), 10e18);
-        // first burner gets the undistributed amount
-        vm.prank(OWNER);
-        token.burn(1e18);
-        assertEq(pot.undistributed(), 0);
-        assertEq(pot.claimable(OWNER), 10e18); // the carry goes to the first burner
-        // new fees then accrue to the owner only
-        buy(alice, -1000e18);
-        hook.redeemFees();
-        vm.warp(vm.getBlockTimestamp() + 7 days);
-        assertApproxEqAbs(pot.claimable(OWNER), 20e18, 1e6);
-        vm.prank(OWNER);
-        assertApproxEqAbs(pot.claim(), 20e18, 1e6);
-    }
-
-    function test_rewardPot_accessAndEmptyClaim() public {
-        vm.expectRevert(RewardPot.NotHook.selector);
-        pot.addPoints(alice, 1);
-        vm.expectRevert(RewardPot.NotHook.selector);
-        pot.notifyDeposit(1);
-        vm.prank(alice);
-        vm.expectRevert(RewardPot.NothingToClaim.selector);
-        pot.claim();
-    }
-
     // ------------------------------------------------------------------ gate logic (harness)
 
     function _harness() internal returns (HookHarness h) {
@@ -264,20 +188,24 @@ contract CompanionsTest is BaseTest {
         assertEq(h.gatesOpen(), 10);
     }
 
-    function test_gatesByBurn_perGateTargetsWithCarry() public {
+    function test_gatesByBurn_perGateTargets() public {
         HookHarness h = _harness();
         h.addBurn(24_000_000e18);
         h.advance(0, false);
         assertEq(h.gatesOpen(), 0);
         assertEq(h.burnProgress(), 24_000_000e18);
-        h.addBurn(30_000_000e18); // 54m total: gate 1 (25m) opens and 22m more opens gate 2, 7m carries
+        assertEq(h.gateBurnRemaining(), 1_000_000e18);
+        h.addBurn(1_000_000e18); // gate 1 target (25m) met exactly
         h.advance(0, false);
-        assertEq(h.gatesOpen(), 2);
-        assertEq(h.burnProgress(), 7_000_000e18);
-        // a gate opened by FDV resets the burn counter for the next gate
-        h.advance(1_000_000e18, true);
-        assertEq(h.gatesOpen(), 3);
+        assertEq(h.gatesOpen(), 1);
         assertEq(h.burnProgress(), 0);
+        assertEq(h.gateBurnRemaining(), 22_000_000e18);
+        h.addBurn(5_000_000e18);
+        // a gate opened by FDV resets the burn counter for the next gate
+        h.advance(500_000e18, true);
+        assertEq(h.gatesOpen(), 2);
+        assertEq(h.burnProgress(), 0);
+        assertEq(h.gateBurnRemaining(), 19_000_000e18);
     }
 
     function testFuzz_gatesNeverDecrease(uint256 fdvA, uint256 fdvB, uint256 vol) public {

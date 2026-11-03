@@ -99,6 +99,24 @@
   },
   {
     "type": "function",
+    "name": "contribute",
+    "inputs": [
+      {
+        "name": "expectedGate",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "decimals",
     "inputs": [],
     "outputs": [
@@ -287,6 +305,31 @@
   },
   {
     "type": "event",
+    "name": "Contributed",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "gate",
+        "type": "uint8",
+        "indexed": true,
+        "internalType": "uint8"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "HookRegistered",
     "inputs": [
       {
@@ -412,6 +455,11 @@
   {
     "type": "error",
     "name": "HookAlreadyRegistered",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "HookNotRegistered",
     "inputs": []
   },
   {
