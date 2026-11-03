@@ -1,0 +1,38 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "UnlockV2Hook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+      "$factory",
+      "$owner",
+      "0x99fa82b022be4575891a43b757bc770691e18fda",
+      "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+      "1"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "UnlockV2Token",
+    "name": "UNLOCK V2",
+    "symbol": "UNLK2",
+    "decimals": 18,
+    "constructorArgs": [],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "The approved workflow does not specify an ETH/USD feed address. The ethUsdFeed_ argument uses 0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419, the Ethereum Chainlink feed named in the accepted repository's docs/README.md and test/ForkRehearsal.t.sol; expectedChainId_ is 1. UnlockV2Token takes no constructor arguments and mints exactly 1,000,000,000 UNLK2 with 18 decimals once to msg.sender, the launch factory. Holder burns reduce supply; there is no later mint. UnlockV2Hook creates MigrationVault and RewardPot in its constructor and attempts to bind itself to the token; isBound() exposes whether binding succeeded. Its enabled hook address flags are 0x20cc. beforeInitialize is restricted to the PoolManager, permits only the launch factory as sender, and accepts the intended UNLK2/IMD PoolKey exactly once with fee 12500 and tick spacing 60. Liquidity setup is possible while swaps are closed. Owner activation requires the initialized pool, chain 1, sufficient remaining migration backing and valid pricing references, then permanently seals configuration. The owner must fund 700,000,000 UNLK2 into the vault and configure supported routers and the native swarm distributor before activation; activate() does not enforce router or distributor configuration. Migration exchanges V1 for V2 one to one, locks V1 irreversibly and has a lifetime 700,000,000-token cap. Official-pool sell rights track credited origins and cumulative sales through ten permanent gates; gate 10 bypasses quotas for every holder. Unregistered routers share rights at the router address. In addition to the 1.25% pool LP fee, the hook collects 1% of the executed IMD leg for RewardPot. Burns earn nontransferable points; gate contributions also count toward gate burn targets. RewardPot attributes fees when earned, streams the pre-point pot over seven days and permits beneficiaries to claim matured weekly rewards. Pricing uses the official pool, the native ETH/IMD reference pool with fee 10000 and tick spacing 200, and the ETH/USD feed. pool.initialPrice records the required reference value; the deployer derives the actual opening price from the separate policy's 2,500 IMD opening market cap, supply and deployed token address. This manifest describes the accepted contracts; launch policy, signed artifact linkage, admission and deployment are handled by services."
+}
